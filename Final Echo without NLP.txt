@@ -1,0 +1,208 @@
+import sys
+import time
+import threading
+import cv2
+import pygame
+from ultralytics import YOLO
+
+# ==========================================
+# ⚙️ CONFIGURATION & INITIALIZATION
+# ==========================================
+CAMERA_INDEX = 0
+CONFIDENCE_THRESHOLD = 0.5
+
+# ⚡ PERFORMANCE OPTIMIZATIONS
+CAM_WIDTH, CAM_HEIGHT = 640, 480  # Capture lower resolution for 3x faster YOLO
+YOLO_SKIP_FRAMES = 3             # Run YOLO every 3rd frame
+
+# 🌤️ CONSTANT WEATHER DATA (Coimbatore)
+CITY = "Coimbatore"
+CONSTANT_TEMP = "28°C"
+CONSTANT_DESC = "Partly Cloudy"
+CONSTANT_HUMIDITY = "Humidity: 65%"
+
+# 🎯 Center Zone Thresholds (Middle 40% of frame)
+CENTER_MIN_RATIO = 0.3
+CENTER_MAX_RATIO = 0.7
+
+print("Loading YOLO model...")
+yolo_model = YOLO("yolov8n.pt")
+
+person_detected = False
+is_running = True
+current_surface = None
+
+# Tracked bounding boxes between YOLO skips
+cached_boxes = []  # Stores (x1, y1, x2, y2, is_center)
+
+# ==========================================
+# 🎥 HIGH-FPS CAMERA THREAD
+# ==========================================
+def camera_detection_loop(screen_width, screen_height):
+    global person_detected, is_running, current_surface, cached_boxes
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"Error: Could not open camera at index {CAMERA_INDEX}")
+        return
+
+    # Set lower resolution at camera source level for massive FPS gain
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    print("🎥 Optimized Camera Thread Started...")
+    
+    frame_count = 0
+
+    while is_running:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame_count += 1
+        h, w, _ = frame.shape
+        center_min_x = int(w * CENTER_MIN_RATIO)
+        center_max_x = int(w * CENTER_MAX_RATIO)
+
+        # 🚀 OPTIMIZATION 1: Run YOLO only every Nth frame
+        if frame_count % YOLO_SKIP_FRAMES == 0:
+            cached_boxes.clear()
+            detected_in_center = False
+
+            # 🚀 OPTIMIZATION 2: Pass classes=[0] to detect ONLY persons
+            results = yolo_model(
+                frame, 
+                verbose=False, 
+                conf=CONFIDENCE_THRESHOLD, 
+                classes=[0], 
+                imgsz=320  # Lower inference image size for speed
+            )
+
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    person_center_x = (x1 + x2) / 2.0
+                    
+                    is_in_center = (center_min_x <= person_center_x <= center_max_x)
+                    if is_in_center:
+                        detected_in_center = True
+                    
+                    cached_boxes.append((x1, y1, x2, y2, is_in_center))
+
+            person_detected = detected_in_center
+
+        # 🎨 Draw cached bounding boxes on every frame (smooth rendering)
+        for x1, y1, x2, y2, is_in_center in cached_boxes:
+            color = (0, 255, 0) if is_in_center else (0, 165, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, "Person", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Draw vertical guide lines for center zone
+        cv2.line(frame, (center_min_x, 0), (center_min_x, h), (255, 255, 255), 1)
+        cv2.line(frame, (center_max_x, 0), (center_max_x, h), (255, 255, 255), 1)
+
+        # 🚀 OPTIMIZATION 3: Fast BGR to RGB & Pygame Surface Conversion
+        resized_frame = cv2.resize(frame, (screen_width, screen_height), interpolation=cv2.INTER_NEAREST)
+        rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+        
+        # Pygame surface conversion from buffer (Zero-copy speed)
+        current_surface = pygame.image.frombuffer(
+            rgb_frame.tobytes(), (screen_width, screen_height), "RGB"
+        )
+
+    cap.release()
+    print("🛑 Camera thread shut down cleanly.")
+
+# ==========================================
+# 🖥️ PYGAME FULLSCREEN UI (HARDWARE ACCEL)
+# ==========================================
+pygame.init()
+info = pygame.display.Info()
+WIDTH, HEIGHT = info.current_w, info.current_h
+
+# 🚀 OPTIMIZATION 4: Enable Pygame Hardware Acceleration Flags
+screen = pygame.display.set_mode(
+    (WIDTH, HEIGHT), 
+    pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
+)
+pygame.display.set_caption("Smart Mirror - High FPS")
+clock = pygame.time.Clock()
+
+# Colors
+WHITE = (255, 255, 255)
+CYAN = (0, 225, 255)
+GREEN = (0, 255, 128)
+GRAY = (180, 180, 180)
+
+# Pre-render static text surfaces to reduce loop rendering overhead
+font_clock = pygame.font.SysFont("Arial", 54, bold=True)
+font_temp = pygame.font.SysFont("Arial", 72, bold=True)
+font_medium = pygame.font.SysFont("Arial", 28, bold=True)
+font_small = pygame.font.SysFont("Arial", 22)
+
+city_surf = font_medium.render(f"📍 {CITY}", True, CYAN)
+temp_surf = font_temp.render(CONSTANT_TEMP, True, WHITE)
+desc_surf = font_medium.render(CONSTANT_DESC, True, GREEN)
+humid_surf = font_small.render(CONSTANT_HUMIDITY, True, GRAY)
+status_active = font_small.render("🟢 User In Center Zone", True, GREEN)
+status_idle = font_small.render("⚪ Standing By...", True, GRAY)
+
+# Create Translucent Sidebar Panel Surface ONCE
+sidebar_width = 380
+sidebar_surface = pygame.Surface((sidebar_width, HEIGHT), pygame.SRCALPHA)
+sidebar_surface.fill((0, 0, 0, 160))
+
+# Start high-FPS camera thread
+cam_thread = threading.Thread(target=camera_detection_loop, args=(WIDTH, HEIGHT), daemon=True)
+cam_thread.start()
+
+running = True
+last_time_str = ""
+
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_x):
+            running = False
+
+    # 1. Render Video Surface
+    if current_surface is not None:
+        screen.blit(current_surface, (0, 0))
+
+    # 2. Render Pre-allocated Translucent Sidebar
+    screen.blit(sidebar_surface, (0, 0))
+
+    padding_x = 30
+
+    # 3. Clock Section (Re-render string only when second changes)
+    now_str = time.strftime("%I:%M:%S %p")
+    if now_str != last_time_str:
+        last_time_str = now_str
+        clock_surf = font_clock.render(now_str, True, WHITE)
+        date_surf = font_small.render(time.strftime("%A, %b %d"), True, GRAY)
+
+    screen.blit(clock_surf, (padding_x, 40))
+    screen.blit(date_surf, (padding_x, 105))
+
+    # Divider line
+    pygame.draw.line(screen, (255, 255, 255, 100), (padding_x, 140), (sidebar_width - padding_x, 140), 1)
+
+    # 4. Weather Section
+    screen.blit(city_surf, (padding_x, 160))
+    screen.blit(temp_surf, (padding_x, 205))
+    screen.blit(desc_surf, (padding_x, 285))
+    screen.blit(humid_surf, (padding_x, 325))
+
+    # 5. Status Indicator
+    status_surf = status_active if person_detected else status_idle
+    screen.blit(status_surf, (padding_x, HEIGHT - 50))
+
+    pygame.display.flip()
+    clock.tick(60)  # Aim for smooth 60 FPS UI refresh rate
+
+# Clean Shutdown
+print("Shutting down Smart Mirror...")
+is_running = False
+cam_thread.join(timeout=2.0)
+pygame.quit()
