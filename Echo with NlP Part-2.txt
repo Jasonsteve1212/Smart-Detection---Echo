@@ -1,0 +1,916 @@
+import sys
+import time
+import threading
+import cv2
+import pygame
+import requests
+import base64
+import pyttsx3
+
+from ultralytics import YOLO
+
+# ==========================================
+# CONFIGURATION & INITIALIZATION
+# ==========================================
+
+CAMERA_INDEX = 0
+CONFIDENCE_THRESHOLD = 0.5
+
+# ==========================================
+# PERFORMANCE OPTIMIZATIONS
+# ==========================================
+
+CAM_WIDTH, CAM_HEIGHT = 640, 480
+YOLO_SKIP_FRAMES = 3
+
+# ==========================================
+# AI SETTINGS
+# ==========================================
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+LLM_MODEL = "gemma3:4b"
+
+# ==========================================
+# WELCOME MESSAGE
+# ==========================================
+
+WELCOME_MESSAGE = "Welcome to CTC Innovation Lab!"
+
+# ==========================================
+# WEATHER DATA
+# ==========================================
+
+CITY = "Coimbatore"
+CONSTANT_TEMP = "28°C"
+CONSTANT_DESC = "Partly Cloudy"
+CONSTANT_HUMIDITY = "Humidity: 65%"
+
+# ==========================================
+# CENTER ZONE
+# ==========================================
+
+CENTER_MIN_RATIO = 0.3
+CENTER_MAX_RATIO = 0.7
+
+# ==========================================
+# LOAD YOLO
+# ==========================================
+
+print("Loading YOLO model...")
+yolo_model = YOLO("yolov8n.pt")
+
+# ==========================================
+# TEXT TO SPEECH
+# ==========================================
+
+print("Starting Text-To-Speech...")
+
+tts_engine = pyttsx3.init()
+
+tts_engine.setProperty("rate", 170)
+tts_engine.setProperty("volume", 1.0)
+
+# ==========================================
+# GLOBAL VARIABLES
+# ==========================================
+
+person_detected = False
+previous_person_detected = False
+
+is_running = True
+current_surface = None
+
+ai_busy = False
+last_ai_time = 0
+
+AI_COOLDOWN = 10
+
+latest_frame = None
+
+frame_lock = threading.Lock()
+
+cached_boxes = []
+
+
+# ==========================================
+# TEXT TO SPEECH FUNCTION
+# ==========================================
+
+def speak(text):
+
+    print("AI:", text)
+
+    try:
+
+        tts_engine.say(text)
+        tts_engine.runAndWait()
+
+    except Exception as e:
+
+        print("TTS Error:", e)
+
+
+# ==========================================
+# FIXED WELCOME MESSAGE
+# ==========================================
+
+def welcome_person():
+
+    speak(WELCOME_MESSAGE)
+
+
+# ==========================================
+# SEND IMAGE TO LOCAL SLM
+# ==========================================
+
+def ask_ai(frame):
+
+    global ai_busy
+
+    try:
+
+        # Convert frame to JPEG
+
+        _, buffer = cv2.imencode(
+            ".jpg",
+            frame
+        )
+
+        image_base64 = base64.b64encode(
+            buffer
+        ).decode("utf-8")
+
+        # ==================================
+        # NLP PROMPT
+        # ==================================
+
+        prompt = """
+You are the AI assistant of CTC Innovation Lab.
+
+The person has already been welcomed.
+
+Make ONE short, friendly observation about
+visible clothing or accessories.
+
+You may mention:
+- clothing color
+- glasses
+- backpack
+- hat
+- visible accessories
+
+Do NOT:
+- rate attractiveness
+- judge beauty
+- comment on body shape or size
+- guess age
+- guess gender
+- guess race or ethnicity
+- identify the person
+- make personal assumptions
+
+Keep the response under 15 words.
+
+Return ONLY the sentence that should be spoken.
+"""
+
+        # ==================================
+        # SEND TO OLLAMA
+        # ==================================
+
+        data = {
+            "model": LLM_MODEL,
+            "prompt": prompt,
+            "images": [image_base64],
+            "stream": False
+        }
+
+        response = requests.post(
+            OLLAMA_URL,
+            json=data,
+            timeout=30
+        )
+
+        # ==================================
+        # READ RESPONSE
+        # ==================================
+
+        if response.status_code == 200:
+
+            result = response.json()
+
+            answer = result.get(
+                "response",
+                ""
+            ).strip()
+
+            if answer:
+
+                speak(answer)
+
+        else:
+
+            print(
+                "Ollama Error:",
+                response.status_code
+            )
+
+    except Exception as e:
+
+        print(
+            "AI Error:",
+            e
+        )
+
+    finally:
+
+        ai_busy = False
+
+
+# ==========================================
+# START AI
+# ==========================================
+
+def start_ai(frame):
+
+    global ai_busy
+    global last_ai_time
+
+    current_time = time.time()
+
+    # Don't run another AI request
+    # if one is already running
+
+    if ai_busy:
+        return
+
+    # Cooldown
+
+    if current_time - last_ai_time < AI_COOLDOWN:
+        return
+
+    ai_busy = True
+    last_ai_time = current_time
+
+    frame_copy = frame.copy()
+
+    ai_thread = threading.Thread(
+        target=ask_ai,
+        args=(frame_copy,),
+        daemon=True
+    )
+
+    ai_thread.start()
+
+
+# ==========================================
+# CAMERA DETECTION LOOP
+# ==========================================
+
+def camera_detection_loop(
+    screen_width,
+    screen_height
+):
+
+    global person_detected
+    global previous_person_detected
+    global is_running
+    global current_surface
+    global cached_boxes
+    global latest_frame
+
+    cap = cv2.VideoCapture(
+        CAMERA_INDEX
+    )
+
+    if not cap.isOpened():
+
+        print(
+            f"Error: Could not open camera "
+            f"at index {CAMERA_INDEX}"
+        )
+
+        return
+
+    # ======================================
+    # CAMERA SETTINGS
+    # ======================================
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        CAM_WIDTH
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        CAM_HEIGHT
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FPS,
+        30
+    )
+
+    print(
+        "Camera Thread Started..."
+    )
+
+    frame_count = 0
+
+    # ======================================
+    # CAMERA LOOP
+    # ======================================
+
+    while is_running:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            continue
+
+        frame_count += 1
+
+        h, w, _ = frame.shape
+
+        center_min_x = int(
+            w * CENTER_MIN_RATIO
+        )
+
+        center_max_x = int(
+            w * CENTER_MAX_RATIO
+        )
+
+        # ==================================
+        # RUN YOLO EVERY 3 FRAMES
+        # ==================================
+
+        if frame_count % YOLO_SKIP_FRAMES == 0:
+
+            cached_boxes.clear()
+
+            detected_in_center = False
+
+            results = yolo_model(
+                frame,
+                verbose=False,
+                conf=CONFIDENCE_THRESHOLD,
+                classes=[0],
+                imgsz=320
+            )
+
+            # ==================================
+            # PROCESS DETECTIONS
+            # ==================================
+
+            for result in results:
+
+                for box in result.boxes:
+
+                    x1, y1, x2, y2 = map(
+                        int,
+                        box.xyxy[0].tolist()
+                    )
+
+                    person_center_x = (
+                        x1 + x2
+                    ) / 2.0
+
+                    is_in_center = (
+                        center_min_x
+                        <= person_center_x
+                        <= center_max_x
+                    )
+
+                    if is_in_center:
+
+                        detected_in_center = True
+
+                    cached_boxes.append(
+                        (
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            is_in_center
+                        )
+                    )
+
+            # ==================================
+            # UPDATE PERSON STATUS
+            # ==================================
+
+            person_detected = (
+                detected_in_center
+            )
+
+            # ==================================
+            # PERSON ENTERED CENTER
+            # ==================================
+
+            if (
+                person_detected
+                and not previous_person_detected
+            ):
+
+                print(
+                    "Person entered center zone!"
+                )
+
+                # ----------------------------------
+                # FIRST: SAY FIXED WELCOME MESSAGE
+                # ----------------------------------
+
+                threading.Thread(
+                    target=welcome_person,
+                    daemon=True
+                ).start()
+
+                # ----------------------------------
+                # THEN: RUN SLM
+                # ----------------------------------
+
+                start_ai(frame)
+
+            # ==================================
+            # PERSON LEFT CENTER
+            # ==================================
+
+            if (
+                not person_detected
+                and previous_person_detected
+            ):
+
+                print(
+                    "Person left center zone."
+                )
+
+            # Save current state
+
+            previous_person_detected = (
+                person_detected
+            )
+
+        # ==================================
+        # SAVE FRAME
+        # ==================================
+
+        with frame_lock:
+
+            latest_frame = frame.copy()
+
+        # ==================================
+        # DRAW BOUNDING BOXES
+        # ==================================
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2,
+            is_in_center
+        ) in cached_boxes:
+
+            if is_in_center:
+
+                color = (
+                    0,
+                    255,
+                    0
+                )
+
+            else:
+
+                color = (
+                    0,
+                    165,
+                    255
+                )
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2
+            )
+
+            cv2.putText(
+                frame,
+                "Person",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+        # ==================================
+        # CENTER ZONE LINES
+        # ==================================
+
+        cv2.line(
+            frame,
+            (center_min_x, 0),
+            (center_min_x, h),
+            (255, 255, 255),
+            1
+        )
+
+        cv2.line(
+            frame,
+            (center_max_x, 0),
+            (center_max_x, h),
+            (255, 255, 255),
+            1
+        )
+
+        # ==================================
+        # CONVERT FRAME FOR PYGAME
+        # ==================================
+
+        resized_frame = cv2.resize(
+            frame,
+            (
+                screen_width,
+                screen_height
+            ),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        rgb_frame = cv2.cvtColor(
+            resized_frame,
+            cv2.COLOR_BGR2RGB
+        )
+
+        current_surface = pygame.image.frombuffer(
+            rgb_frame.tobytes(),
+            (
+                screen_width,
+                screen_height
+            ),
+            "RGB"
+        )
+
+    # ======================================
+    # CLEAN CAMERA SHUTDOWN
+    # ======================================
+
+    cap.release()
+
+    print(
+        "Camera thread shut down cleanly."
+    )
+
+
+# ==========================================
+# PYGAME INITIALIZATION
+# ==========================================
+
+pygame.init()
+
+info = pygame.display.Info()
+
+WIDTH = info.current_w
+HEIGHT = info.current_h
+
+screen = pygame.display.set_mode(
+    (
+        WIDTH,
+        HEIGHT
+    ),
+    pygame.FULLSCREEN
+    | pygame.HWSURFACE
+    | pygame.DOUBLEBUF
+)
+
+pygame.display.set_caption(
+    "CTC Innovation Lab - Smart Mirror"
+)
+
+clock = pygame.time.Clock()
+
+# ==========================================
+# COLORS
+# ==========================================
+
+WHITE = (
+    255,
+    255,
+    255
+)
+
+CYAN = (
+    0,
+    225,
+    255
+)
+
+GREEN = (
+    0,
+    255,
+    128
+)
+
+GRAY = (
+    180,
+    180,
+    180
+)
+
+# ==========================================
+# FONTS
+# ==========================================
+
+font_clock = pygame.font.SysFont(
+    "Arial",
+    54,
+    bold=True
+)
+
+font_temp = pygame.font.SysFont(
+    "Arial",
+    72,
+    bold=True
+)
+
+font_medium = pygame.font.SysFont(
+    "Arial",
+    28,
+    bold=True
+)
+
+font_small = pygame.font.SysFont(
+    "Arial",
+    22
+)
+
+# ==========================================
+# STATIC TEXT
+# ==========================================
+
+city_surf = font_medium.render(
+    f"📍 {CITY}",
+    True,
+    CYAN
+)
+
+temp_surf = font_temp.render(
+    CONSTANT_TEMP,
+    True,
+    WHITE
+)
+
+desc_surf = font_medium.render(
+    CONSTANT_DESC,
+    True,
+    GREEN
+)
+
+humid_surf = font_small.render(
+    CONSTANT_HUMIDITY,
+    True,
+    GRAY
+)
+
+status_active = font_small.render(
+    "🟢 User In Center Zone",
+    True,
+    GREEN
+)
+
+status_idle = font_small.render(
+    "⚪ Standing By...",
+    True,
+    GRAY
+)
+
+# ==========================================
+# SIDEBAR
+# ==========================================
+
+sidebar_width = 380
+
+sidebar_surface = pygame.Surface(
+    (
+        sidebar_width,
+        HEIGHT
+    ),
+    pygame.SRCALPHA
+)
+
+sidebar_surface.fill(
+    (
+        0,
+        0,
+        0,
+        160
+    )
+)
+
+# ==========================================
+# START CAMERA THREAD
+# ==========================================
+
+cam_thread = threading.Thread(
+    target=camera_detection_loop,
+    args=(
+        WIDTH,
+        HEIGHT
+    ),
+    daemon=True
+)
+
+cam_thread.start()
+
+# ==========================================
+# MAIN LOOP
+# ==========================================
+
+running = True
+
+last_time_str = ""
+
+while running:
+
+    # ======================================
+    # EVENTS
+    # ======================================
+
+    for event in pygame.event.get():
+
+        if event.type == pygame.QUIT:
+
+            running = False
+
+        elif (
+            event.type == pygame.KEYDOWN
+            and event.key == pygame.K_x
+        ):
+
+            running = False
+
+    # ======================================
+    # VIDEO
+    # ======================================
+
+    if current_surface is not None:
+
+        screen.blit(
+            current_surface,
+            (0, 0)
+        )
+
+    # ======================================
+    # SIDEBAR
+    # ======================================
+
+    screen.blit(
+        sidebar_surface,
+        (0, 0)
+    )
+
+    padding_x = 30
+
+    # ======================================
+    # CLOCK
+    # ======================================
+
+    now_str = time.strftime(
+        "%I:%M:%S %p"
+    )
+
+    if now_str != last_time_str:
+
+        last_time_str = now_str
+
+        clock_surf = font_clock.render(
+            now_str,
+            True,
+            WHITE
+        )
+
+        date_surf = font_small.render(
+            time.strftime(
+                "%A, %b %d"
+            ),
+            True,
+            GRAY
+        )
+
+    screen.blit(
+        clock_surf,
+        (
+            padding_x,
+            40
+        )
+    )
+
+    screen.blit(
+        date_surf,
+        (
+            padding_x,
+            105
+        )
+    )
+
+    # ======================================
+    # DIVIDER
+    # ======================================
+
+    pygame.draw.line(
+        screen,
+        (
+            255,
+            255,
+            255,
+            100
+        ),
+        (
+            padding_x,
+            140
+        ),
+        (
+            sidebar_width - padding_x,
+            140
+        ),
+        1
+    )
+
+    # ======================================
+    # WEATHER
+    # ======================================
+
+    screen.blit(
+        city_surf,
+        (
+            padding_x,
+            160
+        )
+    )
+
+    screen.blit(
+        temp_surf,
+        (
+            padding_x,
+            205
+        )
+    )
+
+    screen.blit(
+        desc_surf,
+        (
+            padding_x,
+            285
+        )
+    )
+
+    screen.blit(
+        humid_surf,
+        (
+            padding_x,
+            325
+        )
+    )
+
+    # ======================================
+    # STATUS
+    # ======================================
+
+    status_surf = (
+        status_active
+        if person_detected
+        else status_idle
+    )
+
+    screen.blit(
+        status_surf,
+        (
+            padding_x,
+            HEIGHT - 50
+        )
+    )
+
+    # ======================================
+    # UPDATE DISPLAY
+    # ======================================
+
+    pygame.display.flip()
+
+    clock.tick(60)
+
+
+# ==========================================
+# CLEAN SHUTDOWN
+# ==========================================
+
+print(
+    "Shutting down Smart Mirror..."
+)
+
+is_running = False
+
+cam_thread.join(
+    timeout=2.0
+)
+
+pygame.quit()
